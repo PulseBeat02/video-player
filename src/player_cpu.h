@@ -39,6 +39,7 @@ struct AVStream;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct SwrContext;
 
 
 class Player {
@@ -78,7 +79,11 @@ private:
 
     void findVideoStream();
 
+    void findAudioStream();
+
     void initializeDecoder();
+
+    void initializeAudioDecoder();
 
     void allocateFrameResources();
 
@@ -86,11 +91,17 @@ private:
 
     void cleanupSwsContext();
 
+    void cleanupSwrContext();
+
     void cleanupFrames();
+
+    void cleanupAudioFrame();
 
     void cleanupPacket();
 
     void cleanupDecoder();
+
+    void cleanupAudioDecoder();
 
     void cleanupFormatContext();
 
@@ -108,7 +119,7 @@ private:
 
     [[nodiscard]] int getUVPlaneSize() const;
 
-    [[nodiscard]] YUVFrameBuffer constructYUVFrameBuffer(const AVFrame *frame_ptr) const;
+    [[nodiscard]] VideoPixelBuffer constructYUVFrameBuffer(const AVFrame *frame_ptr) const;
 
     [[nodiscard]] static int64_t getFrameTimestamp(const AVFrame *frame_ptr);
 
@@ -133,10 +144,10 @@ private:
     [[nodiscard]] bool shouldStopProcessing() const;
 
     void processAndDisplayFrame(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
-                                const std::function<void(const YUVFrameBuffer &)> &callback);
+                                const std::function<void(const VideoPixelBuffer &)> &callback);
 
     void drainDecoder(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
-                      const std::function<void(const YUVFrameBuffer &)> &callback);
+                      const std::function<void(const VideoPixelBuffer &)> &callback);
 
     bool checkExternalStopRequest() const;
 
@@ -144,25 +155,40 @@ private:
 
     [[nodiscard]] bool isVideoPacket() const;
 
+    [[nodiscard]] bool isAudioPacket() const;
+
+    void recreateSwrContextIfNeeded();
+
+    [[nodiscard]] AudioSampleBuffer constructAudioBuffer(const AVFrame *audio_frame_ptr) const;
+
+    bool tryReceiveAudioFrame(AVFrame *audio_frame_ptr) const;
+
+    void resampleAudio(const AVFrame *src, AVFrame *dst);
+
+    void processAudioPacket(const std::function<void(const AudioSampleBuffer &)> &callback);
+
+    void drainAudioDecoder(AVFrame *audio_frame_ptr, AVFrame *audio_resampled_ptr,
+                           const std::function<void(const AudioSampleBuffer &)> &callback);
+
     void handleSeekRequest();
 
     void performSeek(double time_seconds);
 
     bool trySendPacket() const;
 
-    void processPacket(const std::function<void(const YUVFrameBuffer &)> &callback);
+    void processPacket(const std::function<void(const VideoPixelBuffer &)> &callback);
 
     bool readNextPacket() const;
 
     bool shouldContinuePlayback() const;
 
-    void processVideoPacket(const std::function<void(const YUVFrameBuffer &)> &callback);
+    void processVideoPacket(const std::function<void(const VideoPixelBuffer &)> &callback);
 
-    void handlePacket(const std::function<void(const YUVFrameBuffer &)> &callback);
+    void handlePacket(const std::function<void(const VideoPixelBuffer &)> &callback);
 
     void flushDecoder() const;
 
-    void drainRemainingFrames(const std::function<void(const YUVFrameBuffer &)> &callback);
+    void drainRemainingFrames(const std::function<void(const VideoPixelBuffer &)> &callback);
 
     void savePauseTime();
 
@@ -181,8 +207,18 @@ private:
     SwsContext *sws = nullptr;
     AVPixelFormat last_fmt;
 
+    AVCodecContext *audio_decoder = nullptr;
+    const AVCodec *audio_codec = nullptr;
+    AVFrame *audio_frame = nullptr;
+    AVFrame *audio_resampled = nullptr;
+    SwrContext *swr = nullptr;
+    int last_sample_rate = 0;
+    int last_channels = 0;
+
     int video_stream_index = -1;
+    int audio_stream_index = -1;
     double timebase = 0.0;
+    double audio_timebase = 0.0;
 
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> timing_started{false};

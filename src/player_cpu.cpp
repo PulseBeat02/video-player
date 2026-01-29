@@ -25,21 +25,28 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/channel_layout.h>
 }
 
 Player::Player(const char *url) : last_fmt(AV_PIX_FMT_NONE) {
     openInputFile(url);
     findVideoStream();
+    findAudioStream();
     initializeDecoder();
+    initializeAudioDecoder();
     allocateFrameResources();
 }
 
 Player::~Player() {
     cleanupSwsContext();
+    cleanupSwrContext();
     cleanupFrames();
+    cleanupAudioFrame();
     cleanupPacket();
     cleanupDecoder();
+    cleanupAudioDecoder();
     cleanupFormatContext();
 }
 
@@ -66,6 +73,17 @@ void Player::findVideoStream() {
     codec = codec_ptr;
 }
 
+void Player::findAudioStream() {
+    const AVCodec *codec_ptr = nullptr;
+    audio_stream_index = av_find_best_stream(format_context, AVMEDIA_TYPE_AUDIO, -1, -1, &codec_ptr, 0);
+    if (audio_stream_index < 0) {
+        return;
+    }
+    const auto *audio_stream = format_context->streams[audio_stream_index];
+    audio_timebase = av_q2d(audio_stream->time_base);
+    audio_codec = codec_ptr;
+}
+
 void Player::initializeDecoder() {
     decoder = avcodec_alloc_context3(codec);
     if (!decoder) {
@@ -88,6 +106,28 @@ void Player::initializeDecoder() {
     }
 }
 
+void Player::initializeAudioDecoder() {
+    if (audio_stream_index < 0) {
+        return;
+    }
+    audio_decoder = avcodec_alloc_context3(audio_codec);
+    if (!audio_decoder) {
+        return;
+    }
+    const auto *audio_stream = format_context->streams[audio_stream_index];
+    if (const auto params_result = avcodec_parameters_to_context(audio_decoder, audio_stream->codecpar);
+        params_result < 0) {
+        avcodec_free_context(&audio_decoder);
+        audio_decoder = nullptr;
+        return;
+    }
+    if (const auto open_result = avcodec_open2(audio_decoder, audio_codec, nullptr); open_result != 0) {
+        avcodec_free_context(&audio_decoder);
+        audio_decoder = nullptr;
+        return;
+    }
+}
+
 void Player::allocateFrameResources() {
     packet = av_packet_alloc();
     frame = av_frame_alloc();
@@ -96,6 +136,13 @@ void Player::allocateFrameResources() {
         throw std::runtime_error("Could not allocate AVPacket/AVFrame");
     }
     configureYUV420Frame();
+    if (audio_decoder) {
+        audio_frame = av_frame_alloc();
+        audio_resampled = av_frame_alloc();
+        if (!audio_frame || !audio_resampled) {
+            throw std::runtime_error("Could not allocate audio AVFrame");
+        }
+    }
 }
 
 void Player::configureYUV420Frame() const {
@@ -115,9 +162,21 @@ void Player::cleanupSwsContext() {
     sws = nullptr;
 }
 
+void Player::cleanupSwrContext() {
+    if (!swr) {
+        return;
+    }
+    swr_free(&swr);
+}
+
 void Player::cleanupFrames() {
     av_frame_free(&yuv420);
     av_frame_free(&frame);
+}
+
+void Player::cleanupAudioFrame() {
+    av_frame_free(&audio_resampled);
+    av_frame_free(&audio_frame);
 }
 
 void Player::cleanupPacket() {
@@ -126,6 +185,10 @@ void Player::cleanupPacket() {
 
 void Player::cleanupDecoder() {
     avcodec_free_context(&decoder);
+}
+
+void Player::cleanupAudioDecoder() {
+    avcodec_free_context(&audio_decoder);
 }
 
 void Player::cleanupFormatContext() {
@@ -183,7 +246,7 @@ int Player::getUVPlaneSize() const {
     return linesize * (h / 2);
 }
 
-YUVFrameBuffer Player::constructYUVFrameBuffer(const AVFrame *frame_ptr) const {
+VideoPixelBuffer Player::constructYUVFrameBuffer(const AVFrame *frame_ptr) const {
     const auto w = frame_ptr->width;
     const auto h = frame_ptr->height;
     const auto y_span = std::span<const uint8_t>(frame_ptr->data[0], frame_ptr->linesize[0] * h);
@@ -275,7 +338,7 @@ bool Player::shouldStopProcessing() const {
 }
 
 void Player::processAndDisplayFrame(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
-                                    const std::function<void(const YUVFrameBuffer &)> &callback) {
+                                    const std::function<void(const VideoPixelBuffer &)> &callback) {
     const auto *output = getOutputFrame(frame_ptr, yuv420_ptr);
     waitWhilePaused();
     if (shouldStopProcessing()) {
@@ -287,7 +350,7 @@ void Player::processAndDisplayFrame(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
 }
 
 void Player::drainDecoder(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
-                          const std::function<void(const YUVFrameBuffer &)> &callback) {
+                          const std::function<void(const VideoPixelBuffer &)> &callback) {
     while (true) {
         if (!tryReceiveFrame(frame_ptr)) {
             break;
@@ -314,6 +377,10 @@ bool Player::isVideoPacket() const {
     return packet->stream_index == video_stream_index;
 }
 
+bool Player::isAudioPacket() const {
+    return audio_stream_index >= 0 && packet->stream_index == audio_stream_index;
+}
+
 void Player::handleSeekRequest() {
     if (!seek_requested.load()) {
         return;
@@ -330,6 +397,9 @@ void Player::performSeek(const double time_seconds) {
         return;
     }
     avcodec_flush_buffers(decoder);
+    if (audio_decoder) {
+        avcodec_flush_buffers(audio_decoder);
+    }
     resetTiming();
     base_ts = timestamp;
 }
@@ -342,7 +412,7 @@ bool Player::trySendPacket() const {
     return true;
 }
 
-void Player::processPacket(const std::function<void(const YUVFrameBuffer &)> &callback) {
+void Player::processPacket(const std::function<void(const VideoPixelBuffer &)> &callback) {
     if (!trySendPacket()) {
         return;
     }
@@ -363,25 +433,38 @@ bool Player::shouldContinuePlayback() const {
     return true;
 }
 
-void Player::processVideoPacket(const std::function<void(const YUVFrameBuffer &)> &callback) {
+void Player::processVideoPacket(const std::function<void(const VideoPixelBuffer &)> &callback) {
     if (!isVideoPacket()) {
         return;
     }
     processPacket(callback);
 }
 
-void Player::handlePacket(const std::function<void(const YUVFrameBuffer &)> &callback) {
+void Player::handlePacket(const std::function<void(const VideoPixelBuffer &)> &callback) {
     handleSeekRequest();
     processVideoPacket(callback);
+    if (isAudioPacket()) {
+        const std::function audio_callback = [&](const AudioSampleBuffer &a) {
+            adapter->onAudio(a);
+        };
+        processAudioPacket(audio_callback);
+    }
 }
 
 void Player::flushDecoder() const {
     avcodec_send_packet(decoder, nullptr);
 }
 
-void Player::drainRemainingFrames(const std::function<void(const YUVFrameBuffer &)> &callback) {
+void Player::drainRemainingFrames(const std::function<void(const VideoPixelBuffer &)> &callback) {
     flushDecoder();
     drainDecoder(frame, yuv420, callback);
+    if (audio_decoder) {
+        avcodec_send_packet(audio_decoder, nullptr);
+        const std::function audio_callback = [&](const AudioSampleBuffer &a) {
+            adapter->onAudio(a);
+        };
+        drainAudioDecoder(audio_frame, audio_resampled, audio_callback);
+    }
 }
 
 void Player::play(PlayerEventAdapter &listener) {
@@ -389,7 +472,7 @@ void Player::play(PlayerEventAdapter &listener) {
     listener.onStart();
     listener.onPlay();
     const std::function callback =
-            [&](const YUVFrameBuffer &f) {
+            [&](const VideoPixelBuffer &f) {
         listener.onFrame(f);
     };
     stopped = false;
@@ -469,6 +552,109 @@ double Player::getCurrentTime() const {
         return 0.0;
     }
     return getElapsedTime();
+}
+
+void Player::recreateSwrContextIfNeeded() {
+    if (!audio_decoder) {
+        return;
+    }
+    const int sample_rate = audio_decoder->sample_rate;
+    const int channels = audio_decoder->ch_layout.nb_channels;
+    if (swr && sample_rate == last_sample_rate && channels == last_channels) {
+        return;
+    }
+    cleanupSwrContext();
+    int ret = swr_alloc_set_opts2(
+        &swr,
+        &audio_decoder->ch_layout,
+        AV_SAMPLE_FMT_S16,
+        sample_rate,
+        &audio_decoder->ch_layout,
+        audio_decoder->sample_fmt,
+        sample_rate,
+        0,
+        nullptr
+    );
+    if (ret < 0 || !swr) {
+        swr_free(&swr);
+        return;
+    }
+
+    ret = swr_init(swr);
+    if (ret < 0) {
+        swr_free(&swr);
+        return;
+    }
+    last_sample_rate = sample_rate;
+    last_channels = channels;
+}
+
+AudioSampleBuffer Player::constructAudioBuffer(const AVFrame *audio_frame_ptr) const {
+    const auto data_span = std::span<const uint8_t>(audio_frame_ptr->data[0],
+                                                     audio_frame_ptr->nb_samples * last_channels * 2);
+    const int64_t ts = audio_frame_ptr->best_effort_timestamp;
+    const double pts_sec = isValidTimestamp(ts) ? static_cast<double>(ts) * audio_timebase : 0.0;
+    return {
+        pts_sec,
+        data_span,
+        last_sample_rate,
+        last_channels,
+        audio_frame_ptr->nb_samples
+    };
+}
+
+bool Player::tryReceiveAudioFrame(AVFrame *audio_frame_ptr) const {
+    const auto ret = avcodec_receive_frame(audio_decoder, audio_frame_ptr);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return false;
+    }
+    if (ret < 0) {
+        return false;
+    }
+    return true;
+}
+
+void Player::resampleAudio(const AVFrame *src, AVFrame *dst) {
+    recreateSwrContextIfNeeded();
+    if (!swr) {
+        return;
+    }
+    dst->format = AV_SAMPLE_FMT_S16;
+    dst->ch_layout = src->ch_layout;
+    dst->ch_layout.nb_channels = src->ch_layout.nb_channels;
+    dst->sample_rate = src->sample_rate;
+    dst->nb_samples = src->nb_samples;
+    if (const auto buffer_result = av_frame_get_buffer(dst, 0); buffer_result < 0) {
+        return;
+    }
+    swr_convert(swr, dst->data, dst->nb_samples, src->data, src->nb_samples);
+    dst->pts = src->pts;
+    dst->best_effort_timestamp = src->best_effort_timestamp;
+}
+
+void Player::processAudioPacket(const std::function<void(const AudioSampleBuffer &)> &callback) {
+    if (!audio_decoder) {
+        return;
+    }
+    if (const auto ret = avcodec_send_packet(audio_decoder, packet); ret < 0 && ret != AVERROR(EAGAIN)) {
+        return;
+    }
+    drainAudioDecoder(audio_frame, audio_resampled, callback);
+}
+
+void Player::drainAudioDecoder(AVFrame *audio_frame_ptr, AVFrame *audio_resampled_ptr,
+                                const std::function<void(const AudioSampleBuffer &)> &callback) {
+    while (true) {
+        if (!tryReceiveAudioFrame(audio_frame_ptr)) {
+            break;
+        }
+        resampleAudio(audio_frame_ptr, audio_resampled_ptr);
+        const auto buffer = constructAudioBuffer(audio_resampled_ptr);
+        callback(buffer);
+        if (shouldStopProcessing()) {
+            break;
+        }
+    }
 }
 
 void Player::resetTiming() {

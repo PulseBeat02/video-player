@@ -194,7 +194,7 @@ void init_opengl_renderer(const int width, const int height) {
     }
 }
 
-void display_opengl(const YUVFrameBuffer &frame_buffer) {
+void display_opengl(const VideoPixelBuffer &frame_buffer) {
     auto *win = glfwGetCurrentContext();
     if (!win || glfwWindowShouldClose(win)) {
         return;

@@ -26,6 +26,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -37,15 +38,20 @@ constexpr double EARLY_EPSILON_SEC = 0.0015;
 PlayerGPU::PlayerGPU(const char *url) {
     openInputFile(url);
     findVideoStream();
+    findAudioStream();
     initializeDecoder();
+    initializeAudioDecoder();
     allocateFrameResources();
 }
 
 PlayerGPU::~PlayerGPU() {
     cleanupSwsContext();
+    cleanupSwrContext();
     cleanupFrames();
+    cleanupAudioFrame();
     cleanupPacket();
     cleanupDecoder();
+    cleanupAudioDecoder();
     cleanupFormatContext();
 }
 
@@ -71,6 +77,17 @@ void PlayerGPU::findVideoStream() {
     codec = codec_ptr;
 }
 
+void PlayerGPU::findAudioStream() {
+    const AVCodec *codec_ptr = nullptr;
+    audio_stream_index = av_find_best_stream(format_context, AVMEDIA_TYPE_AUDIO, -1, -1, &codec_ptr, 0);
+    if (audio_stream_index < 0) {
+        return;
+    }
+    const auto *audio_stream = format_context->streams[audio_stream_index];
+    audio_timebase = av_q2d(audio_stream->time_base);
+    audio_codec = codec_ptr;
+}
+
 void PlayerGPU::initializeDecoder() {
     decoder = avcodec_alloc_context3(codec);
     if (!decoder) {
@@ -93,6 +110,28 @@ void PlayerGPU::initializeDecoder() {
     }
 }
 
+void PlayerGPU::initializeAudioDecoder() {
+    if (audio_stream_index < 0) {
+        return;
+    }
+    audio_decoder = avcodec_alloc_context3(audio_codec);
+    if (!audio_decoder) {
+        return;
+    }
+    const auto *audio_stream = format_context->streams[audio_stream_index];
+    if (const auto params_result = avcodec_parameters_to_context(audio_decoder, audio_stream->codecpar);
+        params_result < 0) {
+        avcodec_free_context(&audio_decoder);
+        audio_decoder = nullptr;
+        return;
+    }
+    if (const auto open_result = avcodec_open2(audio_decoder, audio_codec, nullptr); open_result != 0) {
+        avcodec_free_context(&audio_decoder);
+        audio_decoder = nullptr;
+        return;
+    }
+}
+
 void PlayerGPU::allocateFrameResources() {
     packet = av_packet_alloc();
     frame = av_frame_alloc();
@@ -101,6 +140,13 @@ void PlayerGPU::allocateFrameResources() {
         throw std::runtime_error("Could not allocate AVPacket/AVFrame");
     }
     configureYUV420Frame();
+    if (audio_decoder) {
+        audio_frame = av_frame_alloc();
+        audio_resampled = av_frame_alloc();
+        if (!audio_frame || !audio_resampled) {
+            throw std::runtime_error("Could not allocate audio AVFrame");
+        }
+    }
 }
 
 void PlayerGPU::configureYUV420Frame() const {
@@ -118,9 +164,19 @@ void PlayerGPU::cleanupSwsContext() {
     sws = nullptr;
 }
 
+void PlayerGPU::cleanupSwrContext() {
+    if (!swr) return;
+    swr_free(&swr);
+}
+
 void PlayerGPU::cleanupFrames() {
     av_frame_free(&yuv420);
     av_frame_free(&frame);
+}
+
+void PlayerGPU::cleanupAudioFrame() {
+    av_frame_free(&audio_resampled);
+    av_frame_free(&audio_frame);
 }
 
 void PlayerGPU::cleanupPacket() {
@@ -129,6 +185,10 @@ void PlayerGPU::cleanupPacket() {
 
 void PlayerGPU::cleanupDecoder() {
     avcodec_free_context(&decoder);
+}
+
+void PlayerGPU::cleanupAudioDecoder() {
+    avcodec_free_context(&audio_decoder);
 }
 
 void PlayerGPU::cleanupFormatContext() {
@@ -209,6 +269,10 @@ bool PlayerGPU::isVideoPacket() const {
     return packet->stream_index == video_stream_index;
 }
 
+bool PlayerGPU::isAudioPacket() const {
+    return audio_stream_index >= 0 && packet->stream_index == audio_stream_index;
+}
+
 bool PlayerGPU::trySendPacket() const {
     if (const auto ret = avcodec_send_packet(decoder, packet); ret < 0 && ret != AVERROR(EAGAIN)) {
         log_error("Error sending packet to decoder");
@@ -262,6 +326,9 @@ void PlayerGPU::performSeek(const double time_seconds) {
         return;
     }
     avcodec_flush_buffers(decoder);
+    if (audio_decoder) {
+        avcodec_flush_buffers(audio_decoder);
+    }
     resetTiming();
     base_ts = timestamp;
 }
@@ -342,7 +409,7 @@ void PlayerGPU::play(PlayerEventAdapter &listener) {
     resetTiming();
 
     const std::function callback =
-            [&](const YUVFrameBuffer &f) {
+            [&](const VideoPixelBuffer &f) {
         listener.onFrame(f);
     };
     std::optional<FrameCopy> lastPresented;
@@ -352,6 +419,11 @@ void PlayerGPU::play(PlayerEventAdapter &listener) {
             break;
         }
         handleSeekRequest();
+        if (isAudioPacket()) {
+            processAudioPacket();
+            av_packet_unref(packet);
+            continue;
+        }
         if (!isVideoPacket()) {
             av_packet_unref(packet);
             continue;
@@ -366,6 +438,18 @@ void PlayerGPU::play(PlayerEventAdapter &listener) {
     flushDecoder();
     drainDecoderAndPresent(callback, lastPresented);
 
+    if (audio_decoder) {
+        avcodec_send_packet(audio_decoder, nullptr);
+        while (!shouldStopPlayback()) {
+            if (!tryReceiveAudioFrame(audio_frame)) {
+                break;
+            }
+            resampleAudio(audio_frame, audio_resampled);
+            const auto buffer = constructAudioBuffer(audio_resampled);
+            adapter->onAudio(buffer);
+        }
+    }
+
     stop();
     listener.onStop();
 }
@@ -375,7 +459,7 @@ bool PlayerGPU::shouldStopPlayback() const {
 }
 
 void PlayerGPU::pumpPause(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     const std::optional<FrameCopy> &lastPresented) const {
     while (paused.load() && !shouldStopPlayback()) {
         if (lastPresented) {
@@ -387,7 +471,7 @@ void PlayerGPU::pumpPause(
 }
 
 void PlayerGPU::presentWhileWaiting(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     const std::optional<FrameCopy> &lastPresented,
     const double targetPresentationSec) const {
     if (!lastPresented) return;
@@ -405,7 +489,7 @@ bool PlayerGPU::isLateEnoughToDrop(const double targetPresentationSec) const {
 }
 
 void PlayerGPU::presentFrameCopy(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     std::optional<FrameCopy> &lastPresented,
     FrameCopy frameCopy) {
     onFrame(frameCopy.asBuffer());
@@ -413,7 +497,7 @@ void PlayerGPU::presentFrameCopy(
 }
 
 void PlayerGPU::presentFrameCopyWithPts(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     std::optional<FrameCopy> &lastPresented,
     FrameCopy frameCopy,
     const double ptsSec) {
@@ -422,7 +506,7 @@ void PlayerGPU::presentFrameCopyWithPts(
 }
 
 void PlayerGPU::decodeAndPresentAvailableFrames(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     std::optional<FrameCopy> &lastPresented) {
     while (true) {
         if (!tryReceiveFrame(frame)) break;
@@ -447,7 +531,7 @@ void PlayerGPU::decodeAndPresentAvailableFrames(
 }
 
 void PlayerGPU::drainDecoderAndPresent(
-    const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    const std::function<void(const VideoPixelBuffer &)> &onFrame,
     std::optional<FrameCopy> &lastPresented) {
     while (!shouldStopPlayback()) {
         if (!tryReceiveFrame(frame)) break;
@@ -467,5 +551,103 @@ void PlayerGPU::drainDecoderAndPresent(
             frameCopy.pts_sec = ptsToSeconds(timestamp);
         }
         presentFrameCopy(onFrame, lastPresented, std::move(frameCopy));
+    }
+}
+
+void PlayerGPU::recreateSwrContextIfNeeded() {
+    if (!audio_decoder) {
+        return;
+    }
+    const int sample_rate = audio_decoder->sample_rate;
+    const int channels = audio_decoder->ch_layout.nb_channels;
+    if (swr && sample_rate == last_sample_rate && channels == last_channels) {
+        return;
+    }
+    cleanupSwrContext();
+    int ret = swr_alloc_set_opts2(
+        &swr,
+        &audio_decoder->ch_layout,
+        AV_SAMPLE_FMT_S16,
+        sample_rate,
+        &audio_decoder->ch_layout,
+        audio_decoder->sample_fmt,
+        sample_rate,
+        0,
+        nullptr
+    );
+    if (ret < 0 || !swr) {
+        swr_free(&swr);
+        return;
+    }
+
+    ret = swr_init(swr);
+    if (ret < 0) {
+        swr_free(&swr);
+        return;
+    }
+    last_sample_rate = sample_rate;
+    last_channels = channels;
+}
+
+AudioSampleBuffer PlayerGPU::constructAudioBuffer(const AVFrame *audio_frame_ptr) const {
+    const auto data_span = std::span<const uint8_t>(audio_frame_ptr->data[0],
+                                                     audio_frame_ptr->nb_samples * last_channels * 2);
+    const int64_t ts = audio_frame_ptr->best_effort_timestamp;
+    const double pts_sec = isValidTimestamp(ts) ? static_cast<double>(ts) * audio_timebase : 0.0;
+    return {
+        pts_sec,
+        data_span,
+        last_sample_rate,
+        last_channels,
+        audio_frame_ptr->nb_samples
+    };
+}
+
+bool PlayerGPU::tryReceiveAudioFrame(AVFrame *audio_frame_ptr) const {
+    const auto ret = avcodec_receive_frame(audio_decoder, audio_frame_ptr);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return false;
+    }
+    if (ret < 0) {
+        return false;
+    }
+    return true;
+}
+
+void PlayerGPU::resampleAudio(AVFrame *src, AVFrame *dst) {
+    recreateSwrContextIfNeeded();
+    if (!swr) {
+        return;
+    }
+    dst->format = AV_SAMPLE_FMT_S16;
+    dst->ch_layout = src->ch_layout;
+    dst->ch_layout.nb_channels = src->ch_layout.nb_channels;
+    dst->sample_rate = src->sample_rate;
+    dst->nb_samples = src->nb_samples;
+    if (const auto buffer_result = av_frame_get_buffer(dst, 0); buffer_result < 0) {
+        return;
+    }
+    swr_convert(swr, dst->data, dst->nb_samples, const_cast<const uint8_t **>(src->data), src->nb_samples);
+    dst->pts = src->pts;
+    dst->best_effort_timestamp = src->best_effort_timestamp;
+}
+
+void PlayerGPU::processAudioPacket() {
+    if (!audio_decoder) {
+        return;
+    }
+    if (const auto ret = avcodec_send_packet(audio_decoder, packet); ret < 0 && ret != AVERROR(EAGAIN)) {
+        return;
+    }
+    while (true) {
+        if (!tryReceiveAudioFrame(audio_frame)) {
+            break;
+        }
+        resampleAudio(audio_frame, audio_resampled);
+        const auto buffer = constructAudioBuffer(audio_resampled);
+        adapter->onAudio(buffer);
+        if (shouldStopPlayback()) {
+            break;
+        }
     }
 }

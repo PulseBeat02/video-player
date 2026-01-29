@@ -19,8 +19,8 @@
 #pragma once
 #include "utils.h"
 
-void init_opengl_renderer(int width, int height);
+void init_openal_renderer();
 
-void display_opengl(const VideoPixelBuffer &frame_buffer);
+void play_openal(const AudioSampleBuffer &audio_buffer);
 
-void destroy_opengl_renderer();
+void destroy_openal_renderer();

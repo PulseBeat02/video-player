@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <thread>
 #include "utils.h"
 
@@ -35,6 +36,7 @@ struct AVCodec;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct SwrContext;
 
 class PlayerGPU {
 public:
@@ -56,23 +58,23 @@ public:
 
     bool isLateEnoughToDrop(double targetPresentationSec) const;
 
-    static void presentFrameCopy(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    static void presentFrameCopy(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                                  std::optional<FrameCopy> &lastPresented, FrameCopy frameCopy);
 
-    static void presentFrameCopyWithPts(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    static void presentFrameCopyWithPts(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                                         std::optional<FrameCopy> &lastPresented, FrameCopy frameCopy,
                                         double ptsSec);
 
-    void decodeAndPresentAvailableFrames(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    void decodeAndPresentAvailableFrames(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                                          std::optional<FrameCopy> &lastPresented);
 
-    void drainDecoderAndPresent(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    void drainDecoderAndPresent(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                                 std::optional<FrameCopy> &lastPresented);
 
-    void presentWhileWaiting(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    void presentWhileWaiting(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                              const std::optional<FrameCopy> &lastPresented, double targetPresentationSec) const;
 
-    void pumpPause(const std::function<void(const YUVFrameBuffer &)> &onFrame,
+    void pumpPause(const std::function<void(const VideoPixelBuffer &)> &onFrame,
                    const std::optional<FrameCopy> &lastPresented) const;
 
     void pause();
@@ -96,7 +98,11 @@ private:
 
     void findVideoStream();
 
+    void findAudioStream();
+
     void initializeDecoder();
+
+    void initializeAudioDecoder();
 
     void allocateFrameResources();
 
@@ -104,11 +110,17 @@ private:
 
     void cleanupSwsContext();
 
+    void cleanupSwrContext();
+
     void cleanupFrames();
+
+    void cleanupAudioFrame();
 
     void cleanupPacket();
 
     void cleanupDecoder();
+
+    void cleanupAudioDecoder();
 
     void cleanupFormatContext();
 
@@ -137,6 +149,18 @@ private:
     bool readNextPacket() const;
 
     [[nodiscard]] bool isVideoPacket() const;
+
+    [[nodiscard]] bool isAudioPacket() const;
+
+    void recreateSwrContextIfNeeded();
+
+    [[nodiscard]] AudioSampleBuffer constructAudioBuffer(const AVFrame *audio_frame) const;
+
+    bool tryReceiveAudioFrame(AVFrame *audio_frame_ptr) const;
+
+    void resampleAudio(AVFrame *src, AVFrame *dst);
+
+    void processAudioPacket();
 
     bool trySendPacket() const;
 
@@ -167,8 +191,18 @@ private:
     SwsContext *sws = nullptr;
     AVPixelFormat last_fmt = AV_PIX_FMT_NONE;
 
+    AVCodecContext *audio_decoder = nullptr;
+    const AVCodec *audio_codec = nullptr;
+    AVFrame *audio_frame = nullptr;
+    AVFrame *audio_resampled = nullptr;
+    SwrContext *swr = nullptr;
+    int last_sample_rate = 0;
+    int last_channels = 0;
+
     int video_stream_index = -1;
+    int audio_stream_index = -1;
     double timebase = 0.0;
+    double audio_timebase = 0.0;
 
     std::chrono::steady_clock::time_point start_time{};
     std::atomic<bool> timing_started{false};

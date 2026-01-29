@@ -22,10 +22,11 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <functional>
 
-class YUVFrameBuffer {
+class VideoPixelBuffer {
     double pts = 0.0;
     std::span<const uint8_t> y;
     std::span<const uint8_t> u;
@@ -37,14 +38,14 @@ class YUVFrameBuffer {
     int height = 0;
 
 public:
-    YUVFrameBuffer() = default;
+    VideoPixelBuffer() = default;
 
-    YUVFrameBuffer(const double pts,
-                   const std::span<const uint8_t> y,
-                   const std::span<const uint8_t> u,
-                   const std::span<const uint8_t> v,
-                   const int yPitch, const int uPitch, const int vPitch,
-                   const int width, const int height)
+    VideoPixelBuffer(const double pts,
+                     const std::span<const uint8_t> y,
+                     const std::span<const uint8_t> u,
+                     const std::span<const uint8_t> v,
+                     const int yPitch, const int uPitch, const int vPitch,
+                     const int width, const int height)
         : pts(pts), y(y), u(u), v(v),
           yPitch(yPitch), uPitch(uPitch), vPitch(vPitch),
           width(width), height(height) {
@@ -66,6 +67,32 @@ public:
     [[nodiscard]] const uint8_t *getVRow(const int r) const { return v.data() + r * vPitch; }
 };
 
+class AudioSampleBuffer {
+    double pts = 0.0;
+    std::span<const uint8_t> data;
+    int sampleRate = 0;
+    int channels = 0;
+    int numSamples = 0;
+
+public:
+    AudioSampleBuffer() = default;
+
+    AudioSampleBuffer(const double pts,
+                      const std::span<const uint8_t> data,
+                      const int sampleRate,
+                      const int channels,
+                      const int numSamples)
+        : pts(pts), data(data),
+          sampleRate(sampleRate), channels(channels), numSamples(numSamples) {
+    }
+
+    [[nodiscard]] double getPts() const { return pts; }
+    [[nodiscard]] std::span<const uint8_t> getData() const { return data; }
+    [[nodiscard]] int getSampleRate() const { return sampleRate; }
+    [[nodiscard]] int getChannels() const { return channels; }
+    [[nodiscard]] int getNumSamples() const { return numSamples; }
+};
+
 struct FrameCopy {
     double pts_sec = 0.0;
     int width = 0;
@@ -77,7 +104,7 @@ struct FrameCopy {
     std::vector<uint8_t> u;
     std::vector<uint8_t> v;
 
-    [[nodiscard]] YUVFrameBuffer asBuffer() const {
+    [[nodiscard]] VideoPixelBuffer asBuffer() const {
         return {
             pts_sec,
             std::span(y.data(), y.size()),
@@ -181,6 +208,8 @@ struct PlayerEventAdapter {
     std::function<void(double)> onSeek = [](double) {
     };
     std::function<bool()> shouldStopPlayback = [] { return false; };
-    std::function<void(const YUVFrameBuffer &)> onFrame = [](const YUVFrameBuffer &) {
+    std::function<void(const VideoPixelBuffer &)> onFrame = [](const VideoPixelBuffer &) {
+    };
+    std::function<void(const AudioSampleBuffer &)> onAudio = [](const AudioSampleBuffer &) {
     };
 };

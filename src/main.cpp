@@ -14,9 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include "al_renderer.h"
 #include "gl_renderer.h"
 #include "player_gpu.h"
 #include "window.h"
+
+void setup() {
+    init_gl_window();
+    init_openal_renderer();
+}
+
+void teardown() {
+    destroy_openal_renderer();
+    destroy_gl_window();
+}
 
 int main(const int argc, char *argv[]) {
     if (argc < 2) {
@@ -25,9 +36,10 @@ int main(const int argc, char *argv[]) {
     }
     PlayerGPU player(argv[1]);
     PlayerEventAdapter adapter;
-    adapter.onStart = init_gl_window;
-    adapter.onStop = destroy_gl_window;
+    adapter.onStart = setup;
+    adapter.onStop = teardown;
     adapter.onFrame = display_opengl;
+    adapter.onAudio = play_openal;
     adapter.shouldStopPlayback = should_stop;
     player.play(adapter);
     return 0;
