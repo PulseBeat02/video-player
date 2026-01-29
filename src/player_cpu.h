@@ -55,10 +55,7 @@ public:
 
     Player &operator=(Player &&) = delete;
 
-    void play(
-        const std::function<void()> &start,
-        const std::function<void(const YUVFrameBuffer &)> &callback,
-        const std::function<bool()> &should_stop_callback, const std::function<void()> &stop);
+    void play(PlayerEventAdapter &listener);
 
     void pause();
 
@@ -196,5 +193,5 @@ private:
     std::atomic<bool> stopped{false};
     std::atomic<bool> seek_requested{false};
     std::atomic<double> seek_target{0.0};
-    std::function<bool()> stop_callback;
+    PlayerEventAdapter *adapter = nullptr;
 };

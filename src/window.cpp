@@ -31,6 +31,23 @@ static void framebuffer_size_callback(GLFWwindow *window, const int fbW, const i
     glViewport(0, 0, fbW, fbH);
 }
 
+void center_gl_window() {
+    GLFWmonitor *monitor = glfwGetWindowMonitor(display_window);
+    if (!monitor)
+        monitor = glfwGetPrimaryMonitor();
+    int mx, my;
+    glfwGetMonitorPos(monitor, &mx, &my);
+
+    const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+    int winW, winH;
+    glfwGetWindowSize(display_window, &winW, &winH);
+    glfwSetWindowPos(
+        display_window,
+        mx + (mode->width - winW) / 2,
+        my + (mode->height - winH) / 2
+    );
+}
+
 void init_gl_window() {
     if (display_window != nullptr) {
         return;
@@ -48,7 +65,8 @@ void init_gl_window() {
     glViewport(0, 0, fbW, fbH);
     glfwSetFramebufferSizeCallback(display_window, framebuffer_size_callback);
     glDisable(GL_SCISSOR_TEST);
-    init_opengl_renderer(1920, 1080);
+    init_opengl_renderer(960, 540);
+    center_gl_window();
 }
 
 void destroy_gl_window() {

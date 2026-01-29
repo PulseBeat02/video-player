@@ -24,6 +24,11 @@ int main(const int argc, char *argv[]) {
         return 1;
     }
     PlayerGPU player(argv[1]);
-    player.play(init_gl_window, display_opengl, should_stop, destroy_gl_window);
+    PlayerEventAdapter adapter;
+    adapter.onStart = init_gl_window;
+    adapter.onStop = destroy_gl_window;
+    adapter.onFrame = display_opengl;
+    adapter.shouldStopPlayback = should_stop;
+    player.play(adapter);
     return 0;
 }

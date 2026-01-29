@@ -300,10 +300,10 @@ void Player::drainDecoder(AVFrame *frame_ptr, AVFrame *yuv420_ptr,
 }
 
 bool Player::checkExternalStopRequest() const {
-    if (!stop_callback) {
+    if (!adapter->shouldStopPlayback()) {
         return false;
     }
-    return stop_callback();
+    return true;
 }
 
 void Player::unreferencePacket() const {
@@ -384,12 +384,14 @@ void Player::drainRemainingFrames(const std::function<void(const YUVFrameBuffer 
     drainDecoder(frame, yuv420, callback);
 }
 
-void Player::play(
-    const std::function<void()> &start,
-    const std::function<void(const YUVFrameBuffer &)> &callback,
-    const std::function<bool()> &should_stop_callback, const std::function<void()> &stop) {
-    start();
-    stop_callback = should_stop_callback;
+void Player::play(PlayerEventAdapter &listener) {
+    this->adapter = &listener;
+    listener.onStart();
+    listener.onPlay();
+    const std::function callback =
+            [&](const YUVFrameBuffer &f) {
+        listener.onFrame(f);
+    };
     stopped = false;
     resetTiming();
     while (readNextPacket()) {
@@ -402,6 +404,8 @@ void Player::play(
     }
     drainRemainingFrames(callback);
     stop();
+    listener.onStop();
+    free(this->adapter);
 }
 
 void Player::savePauseTime() {
@@ -411,6 +415,7 @@ void Player::savePauseTime() {
 }
 
 void Player::pause() {
+    adapter->onPause();
     if (paused.load()) {
         return;
     }
@@ -427,6 +432,7 @@ void Player::restoreTimeAfterPause() {
 }
 
 void Player::resume() {
+    adapter->onResume();
     if (!paused.load()) {
         return;
     }
@@ -435,10 +441,12 @@ void Player::resume() {
 }
 
 void Player::stop() {
+    adapter->onStop();
     stopped = true;
 }
 
 void Player::seek(const double time_seconds) {
+    adapter->onSeek(time_seconds);
     seek_target = time_seconds;
     seek_requested = true;
 }

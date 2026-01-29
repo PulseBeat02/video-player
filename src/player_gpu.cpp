@@ -244,7 +244,7 @@ void PlayerGPU::waitWhilePaused() const {
 }
 
 bool PlayerGPU::checkExternalStopRequest() const {
-    return stop_callback ? stop_callback() : false;
+    return adapter->shouldStopPlayback();
 }
 
 void PlayerGPU::handleSeekRequest() {
@@ -255,6 +255,7 @@ void PlayerGPU::handleSeekRequest() {
 }
 
 void PlayerGPU::performSeek(const double time_seconds) {
+    adapter->onSeek(time_seconds);
     const auto timestamp = static_cast<int64_t>(time_seconds / timebase);
     if (const auto seek_result = av_seek_frame(format_context, video_stream_index, timestamp, AVSEEK_FLAG_BACKWARD);
         seek_result < 0) {
@@ -280,6 +281,7 @@ double PlayerGPU::getCurrentTime() const {
 }
 
 void PlayerGPU::pause() {
+    adapter->onPause();
     if (paused.load()) return;
     paused = true;
     const auto now = std::chrono::steady_clock::now();
@@ -287,6 +289,7 @@ void PlayerGPU::pause() {
 }
 
 void PlayerGPU::resume() {
+    adapter->onResume();
     if (!paused.load()) return;
     paused = false;
     using Clock = std::chrono::steady_clock;
@@ -295,10 +298,12 @@ void PlayerGPU::resume() {
 }
 
 void PlayerGPU::stop() {
+    adapter->onStop();
     stopped = true;
 }
 
 void PlayerGPU::seek(const double time_seconds) {
+    adapter->onSeek(time_seconds);
     seek_target = time_seconds;
     seek_requested = true;
 }
@@ -327,47 +332,42 @@ FrameCopy PlayerGPU::copyFrame(const AVFrame *yuv420_frame) const {
     return buffer_frame;
 }
 
-void PlayerGPU::play(
-    const std::function<void()> &start,
-    const std::function<void(const YUVFrameBuffer &)> &callback,
-    const std::function<bool()> &should_stop_callback,
-    const std::function<void()> &stop) {
-    start();
+void PlayerGPU::play(PlayerEventAdapter &listener) {
+    this->adapter = &listener;
+    listener.onStart();
+    listener.onPlay();
     glfwSwapInterval(1);
 
-    stop_callback = should_stop_callback;
     stopped = false;
     resetTiming();
 
+    const std::function callback =
+            [&](const YUVFrameBuffer &f) {
+        listener.onFrame(f);
+    };
     std::optional<FrameCopy> lastPresented;
-
     while (readNextPacket()) {
         if (shouldStopPlayback()) {
             av_packet_unref(packet);
             break;
         }
-
         handleSeekRequest();
-
         if (!isVideoPacket()) {
             av_packet_unref(packet);
             continue;
         }
-
         if (!trySendPacket()) {
             av_packet_unref(packet);
             continue;
         }
-
         decodeAndPresentAvailableFrames(callback, lastPresented);
-
         av_packet_unref(packet);
     }
-
     flushDecoder();
     drainDecoderAndPresent(callback, lastPresented);
 
     stop();
+    listener.onStop();
 }
 
 bool PlayerGPU::shouldStopPlayback() const {
