@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <cstring>
 
 #include "utils.h"
 
