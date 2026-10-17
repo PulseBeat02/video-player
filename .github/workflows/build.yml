@@ -44,7 +44,7 @@ jobs:
             triplet: x64-osx
             msvc_arch: ''
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             triplet: arm64-osx
             msvc_arch: ''
 
