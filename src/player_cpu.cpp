@@ -619,9 +619,11 @@ void Player::resampleAudio(const AVFrame *src, AVFrame *dst) {
     if (!swr) {
         return;
     }
+    av_frame_unref(dst);
     dst->format = AV_SAMPLE_FMT_S16;
-    dst->ch_layout = src->ch_layout;
-    dst->ch_layout.nb_channels = src->ch_layout.nb_channels;
+    if (const auto layout_result = av_channel_layout_copy(&dst->ch_layout, &src->ch_layout); layout_result < 0) {
+        return;
+    }
     dst->sample_rate = src->sample_rate;
     dst->nb_samples = src->nb_samples;
     if (const auto buffer_result = av_frame_get_buffer(dst, 0); buffer_result < 0) {
