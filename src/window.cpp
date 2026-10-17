@@ -76,4 +76,5 @@ void destroy_gl_window() {
     destroy_opengl_renderer();
     glfwDestroyWindow(display_window);
     glfwTerminate();
+    display_window = nullptr;
 }
